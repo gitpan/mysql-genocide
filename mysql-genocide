@@ -37,7 +37,7 @@ mysql-genocide [OPTIONS] [FILTER]
 
 =head1 OPTIONS
 
-=over 8
+=over 4
 
 =item B<--help>
 
@@ -194,6 +194,42 @@ concurrent and keep only the 10 most concurent ones:
 
     mysql-genocide --placeholder --group --sort concurrency --limit 10 --list
 
+=head1 SQL EXTENDED INFO
+
+You can add some information in your SQL queries to help mysql-genocide to do some decisions. To
+pass this kind of information, you can use SQL comments like this:
+
+  /* VARIABLE[:VALUE] */ SELECT * FROM...
+
+NOTE: in certain versions of mysql CLI client strip comments before to send them to the server.
+
+=head3 AVAILABLE EXTENDED INFO
+
+=over 4
+
+=item B<TIMEOUT:SECONDS>
+
+This option hint C<mysql-genocide> on the maximum execution time the query should take. The option
+B<--timeout> will keep only queries with an execution time which exceeded this value.
+
+The timeout can be provided with the query in a comment like this:
+
+  /* timeout:40 */ SELECT * FROM table;
+
+Timeout is expressed in second.
+
+=item B<DO_NOT_KILL>
+
+If this option is present in query, the query won't be killed when B<--kill> option is used, even
+if it match the filters. If you combine B<--list> and B<--kill> on the same command, such queries
+will appear in the listed queries but won't be killed.
+
+Example query:
+
+  /* DO_NOT_KILL */ SELECT * FROM important_data;
+
+=back
+
 =head1 SCRIPT CATEGORIES
 
 Unix/System_administration
@@ -218,7 +254,7 @@ use DBI;
 use Getopt::Long;
 use Pod::Usage;
 
-our $VERSION = "0.02";
+our $VERSION = "0.03";
 our @WRITE_CMD = qw(insert replace update delete create drop alter);
 our $WRITE_CMD_RE = join('|', @WRITE_CMD);
 our %EXCLUDE;
@@ -331,7 +367,11 @@ my $dsn = 'DBI:mysql:';
 $dsn .= 'database=' . $OPTS{'database'} . ';' if($OPTS{'database'});
 $dsn .= 'host='     . $OPTS{'host'}     . ';' if($OPTS{'host'});
 $dsn .= 'port='     . $OPTS{'port'}     . ';' if($OPTS{'port'});
-$dsn .= 'mysql_read_default_file=' . $ENV{'HOME'} . '/my.cnf';
+
+if(defined($ENV{'HOME'}))
+{
+    $dsn .= 'mysql_read_default_file=' . $ENV{'HOME'} . '/.my.cnf';
+}
 
 my $dbh = DBI->connect($dsn, $OPTS{'user'}, $OPTS{'password'})
     or die('Cannot connect to database server');
@@ -348,11 +388,15 @@ while(1)
 
     PROC: while($proc = $sth->fetchrow_hashref())
     {
-        $proc->{'Db'}       = $proc->{'db'};
-        $proc->{'Timeout'}  = undef;
+        $proc->{'Db'}               = $proc->{'db'};
+        $proc->{'Timeout'}          = undef;
+        $proc->{'KillProtection'}   = 0;
 
         if(defined($proc->{'Info'}) && $proc->{'Info'} ne '')
         {
+            # clean SQL query indentation
+            $proc->{'Info'} =~ s/[\n\s]+/ /gm;
+
             if($proc->{'User'} eq 'system user')
             {
                 $proc->{'QType'} = 'system';
@@ -371,13 +415,16 @@ while(1)
                 $proc->{'QType'} = 'other';
             }
 
-            # clean SQL query indentation
-            $proc->{'Info'} =~ s/[\n\s]+/ /gm;
-
             # parse timeout hint
-            if($proc->{'Info'} =~ m!/\*.*?timeout\s*:\s*(\d+).*?\*/!)
+            if($proc->{'Info'} =~ m!/\*.*?TIMEOUT\s*:\s*(\d+).*?\*/!i)
             {
                 $proc->{'Timeout'} = $1;
+            }
+
+            # parse DO_NOT_KILL option
+            if($proc->{'Info'} =~ m!/\*.*?DO_NOT_KILL.*?\*/!i)
+            {
+                $proc->{'KillProtection'} = 1;
             }
 
             if($OPTS{'placeholder'})
@@ -540,7 +587,10 @@ while(1)
     {
         foreach(@proclist)
         {
-            $dbh->do('KILL ' . $_);
+            if(!$threads{$_}->{'KillProtection'})
+            {
+                $dbh->do('KILL ' . $_);
+            }
         }
     }
 
